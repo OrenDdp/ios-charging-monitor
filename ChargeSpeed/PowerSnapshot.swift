@@ -28,6 +28,12 @@ struct PowerSnapshot {
         self.chargeStatus = chargeStatus
     }
 
+    /// Multiplier on IQ0u and IQ0B (and everything computed from them). 2 once `PowerMonitor` has
+    /// confirmed the 18 Pro Max half reading against the battery % rate, otherwise 1. The raw
+    /// `sensors` list is never scaled.
+    var halfCorrection: Double = 1
+    var isHalfCorrected: Bool { halfCorrection != 1 }
+
     /// e.g. "Charging", "Charging On Hold", "Charged".
     var chargeStatusText: String? { chargeStatus?["chargeStatus"] as? String }
 
@@ -141,7 +147,7 @@ struct PowerSnapshot {
     }
 
     var usbInputVoltage: Double? { sensor(key: "VQ0u", name: "Charger VQ0u") }
-    var usbInputCurrent: Double? { sensor(key: "IQ0u", name: "Charger IQ0u") }
+    var usbInputCurrent: Double? { sensor(key: "IQ0u", name: "Charger IQ0u").map { $0 * halfCorrection } }
     var wirelessInputVoltage: Double? { sensor(key: "VQ1u", name: "Charger VQ1u") }
     var isWirelessInput: Bool { (wirelessInputVoltage ?? 0) > 1 && (usbInputVoltage ?? 0) < 1 }
     /// iOS describes MagSafe pucks as "magsafe chg" and plain Qi pads as "baseline arcas".
@@ -152,7 +158,7 @@ struct PowerSnapshot {
     /// reports discharge current, so it is only meaningful while external power is connected.
     var sensorBatteryCurrent: Double? {
         guard externalConnected else { return nil }
-        return sensor(key: "IQ0B", name: "Charger IQ0B")
+        return sensor(key: "IQ0B", name: "Charger IQ0B").map { $0 * halfCorrection }
     }
     var sensorBatteryVoltage: Double? {
         sensor(key: "VQ0l", name: "Charger VQ0l") ?? sensor(key: "VP0u", name: "PMU VP0u")
@@ -213,11 +219,12 @@ struct PowerSnapshot {
     /// The headline number: charger input while plugged in. On battery only the macOS registry
     /// reports drain; iOS has no discharge sensor, so the headline is empty there.
     var primaryWatts: (value: Double, label: String)? {
+        let corrected = isHalfCorrected ? " · corrected ×2" : ""
         if externalConnected, let w = chargerInputWatts {
-            return (w, isWirelessInput ? "from charger (MagSafe)" : "from charger (USB-C)")
+            return (w, (isWirelessInput ? "from charger (MagSafe)" : "from charger (USB-C)") + corrected)
         }
         if let w = batteryWatts {
-            if externalConnected { return (w, isWirelessInput ? "into battery (\(wirelessKind))" : "into battery") }
+            if externalConnected { return (w, (isWirelessInput ? "into battery (\(wirelessKind))" : "into battery") + corrected) }
             return (w, "from battery")
         }
         return nil

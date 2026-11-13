@@ -79,9 +79,31 @@ final class PowerMonitor: ObservableObject {
         let inputWattsBefore: Double
         /// Per-tick sensor and adapter fields around the drop, for the raw dump.
         var log: [String]
+        var verdict: HalfVerdict = .waiting
+        /// Battery energy as shown (uncorrected IQ0B × VQ0l) summed since the suspicion, in Wh.
+        var shownWh: Double = 0
+        var lastTick: Date?
+        /// Percent changes since the suspicion with `shownWh` at that moment. Cleared when ticks are
+        /// missing (app in background), since the shown energy would then be undercounted.
+        var steps: [(date: Date, percent: Int, shownWh: Double)] = []
         var inputRatio: Double { inputAmpsAfter / inputAmpsBefore }
         var batteryRatio: Double { batteryAmpsAfter / batteryAmpsBefore }
     }
+
+    /// Result of comparing the battery % rate with the shown battery watts after a suspicion.
+    enum HalfVerdict {
+        case waiting
+        /// % rate within 1.6–2.6 × shown: the readings are doubled from then on.
+        case confirmed(rateWatts: Double, shownWatts: Double)
+        /// % rate within 1.3 × shown: the drop was real (load, heat, taper), not the half reading.
+        case rejected(rateWatts: Double, shownWatts: Double)
+        /// In between; waiting for more steps.
+        case unclear(rateWatts: Double, shownWatts: Double)
+
+        var isConfirmed: Bool { if case .confirmed = self { return true } else { return false } }
+    }
+    private static let halfConfirmRange = 1.6...2.6
+    private static let halfRejectBelow = 1.3
 
     private struct HalfSample {
         let date: Date
@@ -186,19 +208,21 @@ final class PowerMonitor: ObservableObject {
         let sources = reader.readPowerSources()
         let internalBattery = sources.first { ($0["Type"] as? String) == "InternalBattery" } ?? sources.first
         if refreshCount % 30 == 1 { sensors?.rescan() }
-        let snap = PowerSnapshot(date: .now,
+        var snap = PowerSnapshot(date: .now,
                                  raw: props,
                                  powerSource: internalBattery,
                                  adapterDetails: reader.readAdapterDetails(),
                                  sensors: sensors?.read() ?? [],
                                  chargeStatus: reader.readChargeStatus())
         chargeStatusError = reader.chargeStatusError
+        if snap.externalConnected, halfSuspicion?.verdict.isConfirmed == true { snap.halfCorrection = 2 }
         snapshot = snap
         updateEstimate(snap)
         updateHold(snap)
         updateSession(snap)
         updatePeak(snap)
         updateHalfDetection(snap)
+        updateHalfCheck(snap)
         let state = ProcessInfo.processInfo.thermalState
         if state != thermalState { thermalState = state }
         let notifyState = SmartChargeNotificationState()
@@ -266,6 +290,7 @@ final class PowerMonitor: ObservableObject {
                 + String(format: "IQ0u %.3f → %.3f A (×%.2f), IQ0B %.3f → %.3f A (×%.2f), input before %.1f W",
                          s.inputAmpsBefore, s.inputAmpsAfter, s.inputRatio,
                          s.batteryAmpsBefore, s.batteryAmpsAfter, s.batteryRatio, s.inputWattsBefore)
+                + "\nVerdict: \(s.verdict)"
             text += "\n" + s.log.joined(separator: "\n")
         }
         if let ps = snap.powerSource { text += "\n\nIOPS:\n" + dump(ps) }
@@ -501,6 +526,57 @@ final class PowerMonitor: ObservableObject {
         return vBefore > 0 && abs(vAfter - vBefore) / vBefore < 0.05
             && vBefore * iBefore >= minWatts
             && median(before.map(\.batteryAmps)) > 0.2
+    }
+
+    /// After a suspicion, compares the battery % rate with the shown battery watts over the same
+    /// whole % steps. The % rate is the only reading independent of IQ0B. On the 18 Pro Max the
+    /// percent moves in 5 % steps (~1.1 Wh of 21.75 Wh), so a verdict needs two steps after the
+    /// suspicion: about 3 minutes at 40 W into the battery. Rated capacity is used, so a worn
+    /// battery makes the % rate read high; the 1.6–2.6 band allows for that.
+    /// Once confirmed the verdict is kept until unplug; a rejected or unclear one keeps being
+    /// re-evaluated as more steps arrive.
+    private func updateHalfCheck(_ snap: PowerSnapshot) {
+        guard var s = halfSuspicion, !s.verdict.isConfirmed else { return }
+        defer { halfSuspicion = s }
+        guard snap.isCharging, let percent = snap.percent,
+              let shown = snap.sensorBatteryWatts.map({ $0 / snap.halfCorrection }) else {
+            s.steps.removeAll(); s.lastTick = nil
+            return
+        }
+        if let last = s.lastTick {
+            let dt = snap.date.timeIntervalSince(last)
+            if dt > 5 {
+                s.steps.removeAll()   // missed ticks: the shown energy since the last step is incomplete
+            } else {
+                s.shownWh += shown * dt / 3600
+            }
+        }
+        s.lastTick = snap.date
+        if s.steps.last?.percent != percent {
+            // The first entry after a suspicion or a gap is mid-step; only changes count as step edges.
+            s.steps.append((snap.date, percent, s.shownWh))
+            if s.steps.count > 4 { s.steps.removeFirst(s.steps.count - 4) }
+        }
+        let edges = s.steps.dropFirst()
+        guard edges.count >= 2, let first = edges.first, let last = edges.last else { return }
+        let hours = last.date.timeIntervalSince(first.date) / 3600
+        let deltaPercent = Double(last.percent - first.percent)
+        // At least a minute, in case a device reports 1 % steps (seconds apart at 40 W).
+        guard hours * 3600 >= 60, deltaPercent >= 1 else { return }
+        let rateWatts = deltaPercent / 100 * batteryWattHours / hours
+        let shownWatts = (last.shownWh - first.shownWh) / hours
+        guard shownWatts > 0.5 else { return }
+        let ratio = rateWatts / shownWatts
+        if Self.halfConfirmRange.contains(ratio) {
+            s.verdict = .confirmed(rateWatts: rateWatts, shownWatts: shownWatts)
+        } else if ratio < Self.halfRejectBelow {
+            s.verdict = .rejected(rateWatts: rateWatts, shownWatts: shownWatts)
+        } else {
+            s.verdict = .unclear(rateWatts: rateWatts, shownWatts: shownWatts)
+        }
+        #if DEBUG
+        print("HALF check rate \(rateWatts) W shown \(shownWatts) W ratio \(ratio) → \(s.verdict)")
+        #endif
     }
 
     private func median(_ values: [Double]) -> Double {

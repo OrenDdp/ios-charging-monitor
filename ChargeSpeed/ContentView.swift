@@ -59,6 +59,21 @@ struct ContentView: View {
 
     // MARK: Hero
 
+    private func halfText(_ s: PowerMonitor.HalfSuspicion) -> String {
+        let since = s.date.formatted(date: .omitted, time: .shortened)
+        let drop = String(format: "input fell %.1f → %.1f A at %@", s.inputAmpsBefore, s.inputAmpsAfter, since)
+        switch s.verdict {
+        case .waiting:
+            return "Possible half reading: \(drop). Checking against the % rate (needs two 5 % steps)."
+        case let .confirmed(rate, shown):
+            return String(format: "Corrected ×2: %% rate %.1f W vs %.1f W shown into battery (%@).", rate, shown, drop)
+        case let .rejected(rate, shown):
+            return String(format: "Not a half reading: %% rate %.1f W matches %.1f W shown. Readings left as is.", rate, shown)
+        case let .unclear(rate, shown):
+            return String(format: "Possible half reading: %% rate %.1f W vs %.1f W shown, inconclusive. Not corrected.", rate, shown)
+        }
+    }
+
     @ViewBuilder
     private func heroSection(_ snap: PowerSnapshot) -> some View {
         Section {
@@ -79,12 +94,10 @@ struct ContentView: View {
                         .foregroundStyle(.red)
                 }
                 if let s = monitor.halfSuspicion {
-                    Label(String(format: "Possible half reading since %@: input fell %.1f → %.1f A with the same contract. Not corrected.",
-                                 s.date.formatted(date: .omitted, time: .shortened),
-                                 s.inputAmpsBefore, s.inputAmpsAfter),
-                          systemImage: "exclamationmark.triangle.fill")
+                    Label(halfText(s), systemImage: s.verdict.isConfirmed
+                          ? "checkmark.seal" : "exclamationmark.triangle.fill")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(s.verdict.isConfirmed ? .blue : .orange)
                         .multilineTextAlignment(.center)
                 } else if snap.mayReadHalf {
                     Label("Above ~30 W, 18 Pro Max units have read about half of a USB-C meter. See README.",
