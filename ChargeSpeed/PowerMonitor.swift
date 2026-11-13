@@ -64,6 +64,43 @@ final class PowerMonitor: ObservableObject {
     private static let holdDebounce: TimeInterval = 45
     private static let holdKey = "lastHoldObservation"
 
+    /// Set when IQ0u and IQ0B fall in one of the onset patterns of the 18 Pro Max half reading
+    /// (CLAUDE.md) while the adapter contract and VQ0u stay the same. A real
+    /// load or thermal drop can look the same, so this is a suspicion only; nothing is doubled here.
+    /// Kept until unplug; the half reading has not been seen to recover while plugged in.
+    @Published private(set) var halfSuspicion: HalfSuspicion?
+
+    struct HalfSuspicion {
+        let date: Date
+        let inputAmpsBefore: Double
+        let inputAmpsAfter: Double
+        let batteryAmpsBefore: Double
+        let batteryAmpsAfter: Double
+        let inputWattsBefore: Double
+        /// Per-tick sensor and adapter fields around the drop, for the raw dump.
+        var log: [String]
+        var inputRatio: Double { inputAmpsAfter / inputAmpsBefore }
+        var batteryRatio: Double { batteryAmpsAfter / batteryAmpsBefore }
+    }
+
+    private struct HalfSample {
+        let date: Date
+        let inputVolts: Double
+        let inputAmps: Double
+        let batteryAmps: Double
+        /// Negotiated profile and active PD index; must not change across a drop.
+        let contract: String
+        let line: String
+    }
+    private var halfSamples: [HalfSample] = []
+    /// Ticks still to append to `halfSuspicion.log` after the drop.
+    private var halfLogTicksLeft = 0
+    /// Ticks before the drop compared with the last few after it. The onset seen on 2026-10-18 had
+    /// one 8 W tick between the full and the half level, so the windows leave a gap for it.
+    private static let halfBeforeTicks = 5
+    private static let halfGapTicks = 2
+    private static let halfAfterTicks = 3
+
     struct RateEstimate {
         let watts: Double
         let steps: Int
@@ -161,6 +198,7 @@ final class PowerMonitor: ObservableObject {
         updateHold(snap)
         updateSession(snap)
         updatePeak(snap)
+        updateHalfDetection(snap)
         let state = ProcessInfo.processInfo.thermalState
         if state != thermalState { thermalState = state }
         let notifyState = SmartChargeNotificationState()
@@ -222,6 +260,13 @@ final class PowerMonitor: ObservableObject {
         if let sc = smartCharge {
             text += "\n\nSmartCharge: obc=\(sc.obcEnabled) mcl=\(sc.mclEnabled) limit=\(sc.mclLimit) deoc=\(sc.deocEnabled) engaged=\(sc.obcEngaged) engagedLimit=\(sc.engagedChargeLimit) ui=\(sc.uiState) errors=\(sc.callErrors)"
             if let raw = sc.rawStatus as? [String: Any] { text += "\n" + dump(raw) }
+        }
+        if let s = halfSuspicion {
+            text += "\n\nHalf-reading suspicion at \(s.date): "
+                + String(format: "IQ0u %.3f → %.3f A (×%.2f), IQ0B %.3f → %.3f A (×%.2f), input before %.1f W",
+                         s.inputAmpsBefore, s.inputAmpsAfter, s.inputRatio,
+                         s.batteryAmpsBefore, s.batteryAmpsAfter, s.batteryRatio, s.inputWattsBefore)
+            text += "\n" + s.log.joined(separator: "\n")
         }
         if let ps = snap.powerSource { text += "\n\nIOPS:\n" + dump(ps) }
         if let ad = snap.adapterDetails { text += "\n\nAdapter:\n" + dump(ad) }
@@ -354,6 +399,114 @@ final class PowerMonitor: ObservableObject {
         if let hold = lastHold, let data = try? JSONEncoder().encode(hold) {
             UserDefaults.standard.set(data, forKey: Self.holdKey)
         }
+    }
+
+    /// Looks for the half-reading onset (pattern A or B below) over the last ten ticks, with the
+    /// same adapter contract and VQ0u throughout. Both compare against an earlier reading, not
+    /// against contract/2, so the ~7 s pause at 1.5 A during the ramp (a rise, not a fall) does not
+    /// trigger it; that pause is what sank the earlier detector.
+    private func updateHalfDetection(_ snap: PowerSnapshot) {
+        guard snap.mayReadHalf, let vIn = snap.usbInputVoltage, let iIn = snap.usbInputCurrent,
+              let iBat = snap.sensorBatteryCurrent else {
+            if !snap.externalConnected { halfSuspicion = nil; halfLogTicksLeft = 0 }
+            halfSamples.removeAll()
+            return
+        }
+        // The adapter side only. PMUConfiguration is the phone's own setting and may be what changes
+        // at the split, so it is logged but not required to stay the same.
+        let contract = [
+            snap.adapterNegotiated.map { "\($0.voltage_mV)mV×\($0.current_mA)mA" } ?? "-",
+            snap.adapterActiveProfile.map { "idx\($0)" } ?? "idx-",
+        ].joined(separator: " ")
+        let pmu = snap.adapter?["PMUConfiguration"].map { String(describing: $0) } ?? "-"
+        let line = String(format: "%@ VQ0u %.3f V IQ0u %.3f A IQ0B %.3f A VQ0l %@ | %@ pmu %@",
+                          ISO8601DateFormatter.string(from: snap.date, timeZone: .current,
+                                                      formatOptions: [.withTime, .withColonSeparatorInTime]),
+                          vIn, iIn, iBat,
+                          snap.sensorBatteryVoltage.map { String(format: "%.3f V", $0) } ?? "-",
+                          contract, pmu)
+        halfSamples.append(HalfSample(date: snap.date, inputVolts: vIn, inputAmps: iIn,
+                                      batteryAmps: iBat, contract: contract, line: line))
+        let needed = Self.halfBeforeTicks + Self.halfGapTicks + Self.halfAfterTicks
+        if halfSamples.count > needed { halfSamples.removeFirst(halfSamples.count - needed) }
+
+        if halfSuspicion != nil {
+            if halfLogTicksLeft > 0 {
+                halfSuspicion?.log.append(line)
+                halfLogTicksLeft -= 1
+            }
+            return
+        }
+        guard halfSamples.count == needed,
+              Set(halfSamples.map(\.contract)).count == 1 else { return }
+        guard let found = stepToHalf() ?? dropoutThenLower() else { return }
+        let (before, after) = found
+        let inBefore = median(before.map(\.inputAmps)), inAfter = median(after.map(\.inputAmps))
+        let batBefore = median(before.map(\.batteryAmps)), batAfter = median(after.map(\.batteryAmps))
+        let vBefore = median(before.map(\.inputVolts))
+        halfSuspicion = HalfSuspicion(date: snap.date,
+                                      inputAmpsBefore: inBefore, inputAmpsAfter: inAfter,
+                                      batteryAmpsBefore: batBefore, batteryAmpsAfter: batAfter,
+                                      inputWattsBefore: vBefore * inBefore,
+                                      log: halfSamples.map(\.line))
+        halfLogTicksLeft = 10
+        #if DEBUG
+        print("HALF suspicion IQ0u \(inBefore) → \(inAfter) A, IQ0B \(batBefore) → \(batAfter) A\n"
+              + halfSamples.map(\.line).joined(separator: "\n"))
+        #endif
+    }
+
+    /// Pattern A (MiniWatts reports, power steady across the split): IQ0u and IQ0B medians step to
+    /// 40–60 % of the level five ticks earlier, from at least 20 W, VQ0u unchanged.
+    private func stepToHalf() -> (before: [HalfSample], after: [HalfSample])? {
+        let before = Array(halfSamples.prefix(Self.halfBeforeTicks))
+        let after = Array(halfSamples.suffix(Self.halfAfterTicks))
+        guard levelsComparable(before, after, minWatts: 20) else { return nil }
+        let inRatio = median(after.map(\.inputAmps)) / median(before.map(\.inputAmps))
+        let batRatio = median(after.map(\.batteryAmps)) / median(before.map(\.batteryAmps))
+        guard (0.40...0.60).contains(inRatio), (0.35...0.65).contains(batRatio) else { return nil }
+        return (before, after)
+    }
+
+    /// Pattern B (measured here 2026-10-18, power still rising across the split): one or two ticks
+    /// of input below half the level just before them (the 8 W tick), then three ticks back above
+    /// 30 % of that level but below 85 % of it. The reading falls only to ~0.75 there because the
+    /// real power rose at the same time, so pattern A alone misses it. A plain hiccup that recovers
+    /// to the previous level is above 85 % and does not count.
+    private func dropoutThenLower() -> (before: [HalfSample], after: [HalfSample])? {
+        let after = Array(halfSamples.suffix(Self.halfAfterTicks))
+        let rest = Array(halfSamples.dropLast(Self.halfAfterTicks))
+        // Dropout ticks sit just before `after`; the reference is the two ticks before the dropout.
+        for dropoutLength in 1...2 {
+            let dropout = rest.suffix(dropoutLength)
+            let reference = Array(rest.dropLast(dropoutLength).suffix(2))
+            guard reference.count == 2, levelsComparable(reference, after, minWatts: 20) else { continue }
+            let refWatts = reference.map { $0.inputVolts * $0.inputAmps }.reduce(0, +) / 2
+            guard dropout.allSatisfy({ $0.inputVolts * $0.inputAmps < 0.5 * refWatts }) else { continue }
+            let afterWatts = after.map { $0.inputVolts * $0.inputAmps }
+            guard afterWatts.allSatisfy({ $0 > 0.3 * refWatts }),
+                  (0.35...0.85).contains(median(afterWatts) / refWatts) else { continue }
+            let batRatio = median(after.map(\.batteryAmps)) / median(reference.map(\.batteryAmps))
+            guard batRatio < 0.9 else { continue }
+            return (reference, after)
+        }
+        return nil
+    }
+
+    /// Same VQ0u (±5 %) on both sides, charging into the battery, and a starting level near where
+    /// the split has been seen (30 W; ~23 W during the ramp).
+    private func levelsComparable(_ before: [HalfSample], _ after: [HalfSample], minWatts: Double) -> Bool {
+        let vBefore = median(before.map(\.inputVolts)), vAfter = median(after.map(\.inputVolts))
+        let iBefore = median(before.map(\.inputAmps))
+        return vBefore > 0 && abs(vAfter - vBefore) / vBefore < 0.05
+            && vBefore * iBefore >= minWatts
+            && median(before.map(\.batteryAmps)) > 0.2
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
     }
 
     /// Tracks percent transitions and converts the slope into watts. powerd's percent has only

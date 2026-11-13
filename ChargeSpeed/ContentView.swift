@@ -78,7 +78,15 @@ struct ContentView: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.red)
                 }
-                if snap.mayReadHalf {
+                if let s = monitor.halfSuspicion {
+                    Label(String(format: "Possible half reading since %@: input fell %.1f → %.1f A with the same contract. Not corrected.",
+                                 s.date.formatted(date: .omitted, time: .shortened),
+                                 s.inputAmpsBefore, s.inputAmpsAfter),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                } else if snap.mayReadHalf {
                     Label("Above ~30 W, 18 Pro Max units have read about half of a USB-C meter. See README.",
                           systemImage: "exclamationmark.triangle")
                         .font(.caption.weight(.semibold))
