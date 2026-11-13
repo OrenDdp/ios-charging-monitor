@@ -97,7 +97,7 @@ struct ContentView: View {
                     Label(halfText(s), systemImage: s.verdict.isConfirmed
                           ? "checkmark.seal" : "exclamationmark.triangle.fill")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(s.verdict.isConfirmed ? .blue : .orange)
+                        .foregroundStyle(s.verdict.isConfirmed ? Color.blue : Color.orange)
                         .multilineTextAlignment(.center)
                 } else if snap.mayReadHalf {
                     Label("Above ~30 W, 18 Pro Max units have read about half of a USB-C meter. See README.",
