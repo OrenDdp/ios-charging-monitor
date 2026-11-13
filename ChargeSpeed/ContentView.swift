@@ -69,6 +69,8 @@ struct ContentView: View {
             return String(format: "Corrected ×2: %% rate %.1f W vs %.1f W shown into battery (%@).", rate, shown, drop)
         case let .rejected(rate, shown):
             return String(format: "Not a half reading: %% rate %.1f W matches %.1f W shown. Readings left as is.", rate, shown)
+        case let .recovered(rate, shown):
+            return String(format: "Was corrected ×2; now %% rate %.1f W matches %.1f W shown, so the readings are whole again. Correction off.", rate, shown)
         case let .unclear(rate, shown):
             return String(format: "Possible half reading: %% rate %.1f W vs %.1f W shown, inconclusive. Not corrected.", rate, shown)
         }

@@ -99,8 +99,18 @@ final class PowerMonitor: ObservableObject {
         case rejected(rateWatts: Double, shownWatts: Double)
         /// In between; waiting for more steps.
         case unclear(rateWatts: Double, shownWatts: Double)
+        /// Was confirmed, then the % rate came back within 1.3 × shown: the readings are whole
+        /// again (one MiniWatts user reports this above about 70 %), so the correction is off.
+        case recovered(rateWatts: Double, shownWatts: Double)
 
         var isConfirmed: Bool { if case .confirmed = self { return true } else { return false } }
+        /// Rejected or recovered: no correction, and a new onset may start a new suspicion.
+        var isSettledWhole: Bool {
+            switch self {
+            case .rejected, .recovered: return true
+            default: return false
+            }
+        }
     }
     private static let halfConfirmRange = 1.6...2.6
     private static let halfRejectBelow = 1.3
@@ -455,13 +465,13 @@ final class PowerMonitor: ObservableObject {
         let needed = Self.halfBeforeTicks + Self.halfGapTicks + Self.halfAfterTicks
         if halfSamples.count > needed { halfSamples.removeFirst(halfSamples.count - needed) }
 
-        if halfSuspicion != nil {
-            if halfLogTicksLeft > 0 {
-                halfSuspicion?.log.append(line)
-                halfLogTicksLeft -= 1
-            }
-            return
+        if halfLogTicksLeft > 0 {
+            halfSuspicion?.log.append(line)
+            halfLogTicksLeft -= 1
         }
+        // An open suspicion (waiting, unclear or corrected) blocks a new one; once the % rate
+        // says the readings are whole, a later onset can start a fresh one.
+        if let s = halfSuspicion, !s.verdict.isSettledWhole { return }
         guard halfSamples.count == needed,
               Set(halfSamples.map(\.contract)).count == 1 else { return }
         guard let found = stepToHalf() ?? dropoutThenLower() else { return }
@@ -532,11 +542,13 @@ final class PowerMonitor: ObservableObject {
     /// whole % steps. The % rate is the only reading independent of IQ0B. On the 18 Pro Max the
     /// percent moves in 5 % steps (~1.1 Wh of 21.75 Wh), so a verdict needs two steps after the
     /// suspicion: about 3 minutes at 40 W into the battery. Rated capacity is used, so a worn
-    /// battery makes the % rate read high; the 1.6–2.6 band allows for that.
-    /// Once confirmed the verdict is kept until unplug; a rejected or unclear one keeps being
-    /// re-evaluated as more steps arrive.
+    /// battery makes the % rate read high; the 1.6–2.6 band allows for that. The % is also costed
+    /// at the 3.87 V nominal voltage while IQ0B × VQ0l uses the real ~4.2 V, which pulls a whole
+    /// reading's ratio to about 0.9 (MiniWatts' `LevelRateCheck` notes the same).
+    /// The check keeps running while corrected, always on the uncorrected watts, so the ×2 comes
+    /// off when the ratio falls back below 1.3. A ratio between the bands leaves it as it is.
     private func updateHalfCheck(_ snap: PowerSnapshot) {
-        guard var s = halfSuspicion, !s.verdict.isConfirmed else { return }
+        guard var s = halfSuspicion else { return }
         defer { halfSuspicion = s }
         guard snap.isCharging, let percent = snap.percent,
               let shown = snap.sensorBatteryWatts.map({ $0 / snap.halfCorrection }) else {
@@ -567,11 +579,15 @@ final class PowerMonitor: ObservableObject {
         let shownWatts = (last.shownWh - first.shownWh) / hours
         guard shownWatts > 0.5 else { return }
         let ratio = rateWatts / shownWatts
+        let wasCorrected = s.verdict.isConfirmed
+        let wasRecovered: Bool = { if case .recovered = s.verdict { return true } else { return false } }()
         if Self.halfConfirmRange.contains(ratio) {
             s.verdict = .confirmed(rateWatts: rateWatts, shownWatts: shownWatts)
         } else if ratio < Self.halfRejectBelow {
-            s.verdict = .rejected(rateWatts: rateWatts, shownWatts: shownWatts)
-        } else {
+            s.verdict = wasCorrected || wasRecovered
+                ? .recovered(rateWatts: rateWatts, shownWatts: shownWatts)
+                : .rejected(rateWatts: rateWatts, shownWatts: shownWatts)
+        } else if !wasCorrected {
             s.verdict = .unclear(rateWatts: rateWatts, shownWatts: shownWatts)
         }
         #if DEBUG
